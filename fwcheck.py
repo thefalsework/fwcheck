@@ -198,6 +198,7 @@ class LeanScan:
     toolchains: dict = field(default_factory=dict)  # path -> content
     manifests: dict = field(default_factory=dict)  # path -> parsed json
     challenge_modules: dict = field(default_factory=dict)  # json path -> challenge_module
+    big_files: list = field(default_factory=list)  # .lean files skipped for size
     skipped_reason: Optional[str] = None
 
 
@@ -231,7 +232,8 @@ def scan_tarball(data: bytes) -> LeanScan:
                 continue
             if not rel.endswith(".lean"):
                 continue
-            if m.size > 8 * 1024 * 1024:
+            if m.size > 64 * 1024 * 1024:
+                scan.big_files.append(rel)
                 continue
             src = tf.extractfile(m).read().decode("utf-8", "replace")
             stripped = strip_lean(src)
@@ -478,6 +480,8 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
             challenge_files.add("/".join(parts[:i] + ["Challenge.lean"]) if i else "Challenge.lean")
 
     if scan is not None:
+        if scan.big_files:
+            rep.add("scan", UNVERIFIABLE, "Lean sources", f"{len(scan.big_files)} .lean file(s) over 64 MB skipped: " + ", ".join(scan.big_files[:3]))
         # challenge files: any *Challenge*.lean or Challenge/ dir, and any module
         # named by a comparator-style json found in the tree (sorry by design)
         for p in scan.sources:
