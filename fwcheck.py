@@ -585,8 +585,11 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
                 rep.add("main_result", MISMATCH, f"{decl} in {f or '?'}",
                         "declaration not found in any .lean file" + (f": {', '.join(missing)}" if len(decls) > 1 else ""))
             elif elsewhere:
-                rep.add("main_result", STALE, f"{decl} in {f}",
-                        "found in " + ", ".join(sorted({w for _, w in elsewhere})) + ", not in the named file")
+                # the named file usually imports or re-exports it; note, don't accuse
+                named_exists = f.lstrip("./") in scan.sources
+                rep.add("main_result", INFO if named_exists else STALE, f"{decl} in {f}",
+                        "declared in " + ", ".join(sorted({w for _, w in elsewhere}))
+                        + (", not literally in the named file" if named_exists else "; the named file does not exist"))
             else:
                 rep.add("main_result", OK, f"{decl} in {f or where}", f"declared in {where}")
             mrs = mr.get("sorry_count")
