@@ -1,4 +1,4 @@
-﻿7324136828/financial-mathematics-project
+7324136828/financial-mathematics-project
 7324136828/sample-lean-project
 adii800/krohn-rhodes-lean
 AIQ-Kitware/aiq-dkps-formalization

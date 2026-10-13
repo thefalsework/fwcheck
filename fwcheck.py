@@ -716,6 +716,11 @@ def main() -> int:
     ap.add_argument("--summarize", help="summarize a survey jsonl")
     ap.add_argument("--resume", action="store_true", help="skip repos already in --out")
     args = ap.parse_args()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     if args.summarize:
         summarize(args.summarize)
@@ -733,7 +738,7 @@ def main() -> int:
             for l in open(args.out, encoding="utf-8"):
                 if l.strip():
                     done.add(json.loads(l)["repo"])
-        repos = [l.strip() for l in open(args.survey, encoding="utf-8") if l.strip() and not l.startswith("#")]
+        repos = [l.strip() for l in open(args.survey, encoding="utf-8-sig") if l.strip() and not l.startswith("#")]
         with open(args.out, "a", encoding="utf-8") as out:
             for i, repo in enumerate(repos, 1):
                 if repo in done:
