@@ -171,7 +171,19 @@ def strip_lean(src: str) -> str:
 
 _SORRY = re.compile(r"(?<![\w.'])sorry(?![\w'])")
 _NATIVE = re.compile(r"(?<![\w.'])native_decide(?![\w'])")
-_AXIOM = re.compile(r"^\s*(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+)*axiom\s+([\w.'«»]+)", re.M)
+_AXIOM = re.compile(r"^\s*(?:@\[[^\]]*\]\s*)?(?:public\s+|private\s+|protected\s+|noncomputable\s+|unsafe\s+|scoped\s+)*axiom\s+([\w.'«»]+)", re.M)
+
+# Files that are sorry/axiom by design or outside the formalization proper.
+_CHALLENGE_PATH = re.compile(r"(^|/)[^/]*challenge[^/]*\.lean$|(^|/)challenge(s)?/", re.I)
+_FIXTURE_PATH = re.compile(r"(^|/)(tests?|fixtures?|controls|expectedfailures|examples?|scripts?|web|site|docs?|blueprint|book|roadmap|future|vendor|archive|legacy[^/]*)/", re.I)
+
+
+def path_class(p: str) -> str:
+    if _CHALLENGE_PATH.search(p):
+        return "challenge"
+    if _FIXTURE_PATH.search(p):
+        return "fixture"
+    return "code"
 _DECL = r"(?:theorem|lemma|def|abbrev|instance|structure|inductive|class|opaque|axiom|example)"
 
 
@@ -240,20 +252,28 @@ def scan_tarball(data: bytes) -> LeanScan:
 def find_decl(scan: LeanScan, name: str, preferred_file: Optional[str]) -> tuple[Optional[str], bool]:
     """Return (file where declared, found_in_preferred)."""
     last = name.split(".")[-1]
-    pat = re.compile(r"(?m)^\s*(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+|nonrec\s+|unsafe\s+|partial\s+)*"
+    pat = re.compile(r"(?m)^\s*(?:@\[[^\]]*\]\s*)?(?:public\s+|private\s+|protected\s+|noncomputable\s+|nonrec\s+|unsafe\s+|partial\s+|meta\s+|scoped\s+)*"
                      + _DECL + r"\s+(?:[\w.'«»]+\.)?" + re.escape(last) + r"(?![\w'])")
     cands = []
-    if preferred_file:
-        pf = preferred_file.lstrip("./")
+    pf = preferred_file.lstrip("./") if preferred_file else None
+    if pf:
         for p in (pf, pf.lstrip("/")):
             if p in scan.sources and pat.search(scan.sources[p]):
                 return p, True
     for p, s in scan.sources.items():
         if pat.search(s):
             cands.append(p)
-    if cands:
-        return cands[0], False
-    return None, False
+    if not cands:
+        return None, False
+    # a named root module `X.lean` covers declarations under `X/`
+    if pf and pf.endswith(".lean"):
+        under = pf[:-5] + "/"
+        for p in cands:
+            if p.startswith(under):
+                return p, True
+    # prefer a non-challenge, non-fixture location when reporting
+    cands.sort(key=lambda p: (path_class(p) != "code", p))
+    return cands[0], False
 
 
 # ----------------------------------------------------------------------------
@@ -458,26 +478,30 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
             challenge_files.add("/".join(parts[:i] + ["Challenge.lean"]) if i else "Challenge.lean")
 
     if scan is not None:
-        # any Challenge.lean, and any module named by a comparator-style json
-        # found in the tree, is a challenge file (sorry by design)
+        # challenge files: any *Challenge*.lean or Challenge/ dir, and any module
+        # named by a comparator-style json found in the tree (sorry by design)
         for p in scan.sources:
-            if p.rsplit("/", 1)[-1] == "Challenge.lean":
+            if path_class(p) == "challenge":
                 challenge_files.add(p)
         for jp, mod in scan.challenge_modules.items():
             rel = str(mod).replace(".", "/") + ".lean"
             parts = jp.split("/")[:-1]
             for i in range(len(parts) + 1):
                 challenge_files.add("/".join(parts[:i] + [rel]) if i else rel)
+        fixture_files = {p for p in scan.sources if p not in challenge_files and path_class(p) == "fixture"}
         # sorry_count (+ sorry_in_definitions, which the schema counts separately)
         chal_sorry = {p: k for p, k in scan.sorry_files.items() if p in challenge_files}
-        counted = {p: k for p, k in scan.sorry_files.items() if p not in challenge_files}
+        fix_sorry = {p: k for p, k in scan.sorry_files.items() if p in fixture_files}
+        counted = {p: k for p, k in scan.sorry_files.items() if p not in challenge_files and p not in fixture_files}
         total = sum(counted.values())
         worst = sorted(counted.items(), key=lambda kv: -kv[1])[:4]
         ev = f"{total} sorry in {len(counted)} of {scan.files} .lean files"
         if worst:
             ev += " (" + ", ".join(f"{p}:{k}" for p, k in worst) + ")"
         if chal_sorry:
-            ev += f"; excluded {sum(chal_sorry.values())} in comparator challenge file(s) {', '.join(chal_sorry)}"
+            ev += f"; not counted: {sum(chal_sorry.values())} in challenge file(s) " + ", ".join(list(chal_sorry)[:4]) + (", ..." if len(chal_sorry) > 4 else "")
+        if fix_sorry:
+            ev += f"; not counted: {sum(fix_sorry.values())} in test/doc/script file(s) " + ", ".join(list(fix_sorry)[:4]) + (", ..." if len(fix_sorry) > 4 else "")
         if claimed_sorry is None:
             rep.add("sorry_count", UNVERIFIABLE, "(not stated)", ev)
         else:
@@ -487,8 +511,12 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
             except Exception:
                 cs, cd = -1, 0
             claim = f"{cs}" + (f" + {cd} in definitions" if cd else "")
+            with_chal = total + sum(chal_sorry.values())
+            with_all = with_chal + sum(fix_sorry.values())
             if cs + cd == total:
                 rep.add("sorry_count", OK, claim, ev)
+            elif cs + cd in (with_chal, with_all):
+                rep.add("sorry_count", OK, claim, ev + " (claim counts the challenge/test files too)")
             elif cs + cd == 0 and total > 0:
                 rep.add("sorry_count", MISMATCH, claim, ev)
             elif cs + cd > total:
@@ -497,16 +525,23 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
                 rep.add("sorry_count", MISMATCH, claim, ev)
 
         # axioms: custom axiom declarations and native_decide
-        custom = [(n, f) for n, f in scan.axioms]
+        custom = [(n, f) for n, f in scan.axioms if f not in challenge_files and f not in fixture_files]
+        aside = [(n, f) for n, f in scan.axioms if f in challenge_files or f in fixture_files]
         nd = scan.native_decide_files
         claimed_set = set(map(str, claimed_axioms)) if isinstance(claimed_axioms, list) else None
         if custom:
-            names = ", ".join(f"{n} ({f})" for n, f in custom[:5])
+            names = ", ".join(f"{n} ({f})" for n, f in custom[:5]) + (", ..." if len(custom) > 5 else "")
             if claimed_set is not None and all(n in claimed_set or n.split(".")[-1] in {c.split(".")[-1] for c in claimed_set} for n, _ in custom):
                 rep.add("axioms", OK, ", ".join(sorted(claimed_set)), f"custom axiom declarations are declared in the record: {names}")
+            elif claimed_set is None:
+                rep.add("axioms", INFO, "(not stated)",
+                        f"record does not state axioms; source declares {len(custom)} custom `axiom`: {names}")
             else:
-                rep.add("axioms", MISMATCH, ", ".join(sorted(claimed_set)) if claimed_set else "(not stated)",
+                rep.add("axioms", MISMATCH, ", ".join(sorted(claimed_set)),
                         f"custom `axiom` declarations in source not listed in status.axioms: {names}")
+        elif aside:
+            rep.add("axioms", INFO, ", ".join(sorted(claimed_set)) if claimed_set else "(not stated)",
+                    f"custom `axiom` only in challenge/test files: " + ", ".join(f"{n} ({f})" for n, f in aside[:3]))
         elif claimed_set is not None:
             extra = claimed_set - STANDARD_AXIOMS
             rep.add("axioms", OK, ", ".join(sorted(claimed_set)),
@@ -529,6 +564,9 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
             f = str(f).strip() if f else None
             if not decl:
                 continue
+            if " " in decl.strip() and not re.search(r"[/,]| and ", decl):
+                rep.add("main_result", UNVERIFIABLE, decl[:60], "declaration field is prose, not a name")
+                continue
             # some records list several declarations in one field ("a / b", "a, b")
             decls = [d.strip("` ") for d in re.split(r"\s*[/,]\s*|\s+and\s+", decl) if d.strip("` ")]
             missing, elsewhere, where = [], [], None
@@ -548,7 +586,7 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
             else:
                 rep.add("main_result", OK, f"{decl} in {f or where}", f"declared in {where}")
             mrs = mr.get("sorry_count")
-            if mrs is not None and where is not None:
+            if mrs is not None and where is not None and where not in challenge_files:
                 k = len(_SORRY.findall(scan.sources.get(where, "")))
                 try:
                     cm = int(mrs)
@@ -613,8 +651,11 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
             when = (r.get("created_at") or "")[:10]
             sha = (r.get("head_sha") or "")[:7]
             ev = f"latest run on {ref}: {concl} ({when}, {sha})"
+            housekeeping = bool(re.search(r"dependabot|pages|release|deploy|update depend|blueprint|docs|doc-gen|website|label", str(name), re.I))
             if concl == "success":
                 rep.add("ci", OK, f"workflow '{name}'", ev)
+            elif housekeeping and concl in ("failure", "timed_out", "startup_failure"):
+                rep.add("ci", INFO, f"workflow '{name}'", ev + " (housekeeping workflow, not a build)")
             elif concl in ("failure", "timed_out", "startup_failure"):
                 # how long has it been failing? look back a few runs
                 hist = gh.get(f"/repos/{repo}/actions/workflows/{w['id']}/runs",
@@ -693,8 +734,12 @@ def summarize(path: str) -> None:
     print("versions: " + ", ".join(f"{k} {v}" for k, v in sorted(vers.items(), key=lambda kv: -kv[1])))
     revs = {}
     for r in ok_rows:
-        revs[r["review_status"] or "(none)"] = revs.get(r["review_status"] or "(none)", 0) + 1
-    print("review.status: " + ", ".join(f"{k} {v}" for k, v in sorted(revs.items(), key=lambda kv: -kv[1])))
+        k = (r["review_status"] or "(none)").strip()
+        k = k if len(k) <= 40 else "(free text)"
+        revs[k] = revs.get(k, 0) + 1
+    print("review.status: " + ", ".join(f"{k} {v}" for k, v in sorted(revs.items(), key=lambda kv: -kv[1])[:12]))
+    noci = [r for r in ok_rows if any(f["check"] == "ci" and f["status"] == UNVERIFIABLE and "no active" in f["evidence"] for f in r["findings"])]
+    print(f"no CI at all: {len(noci)} of {len(ok_rows)}")
     print("\n-- contradicted (claim vs evidence) --")
     for r in sorted(contradicted, key=lambda r: -r["stars"]):
         bad = [f for f in r["findings"] if f["status"] == MISMATCH]
