@@ -3,3 +3,5 @@ __pycache__/
 survey/*.jsonl
 survey/*.log
 survey/NOTES-private.md
+survey/*.log
+survey/*.csv

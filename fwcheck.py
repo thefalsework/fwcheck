@@ -15,10 +15,26 @@ It does not check proofs (the kernel does), and it does not judge whether a
 Lean statement means what the paper says (a human does). It reports the gap
 between what the record claims and what the repository currently shows.
 
+Below the claim-by-claim findings it emits eight "layers": what happens to a
+proof after `lake build` is green, and where "verified" can quietly stop
+being true.
+
+  1 rebuild     toolchain, Mathlib pin and its age, toolchain consistency
+  2 checkers    which checker tools CI uses (comparator, lean4export,
+                landrun, nanoda, lean-action) and whether they are pinned
+  3 linkage     record main_results <-> comparator theorem_names <->
+                challenge module <-> project declaration, all four corners
+  4 statements  static triage of each main result: kind, binders, proof
+                leader, references to axioms / opaque / sorry-bodied defs
+  5 literature  literature_dependencies and sources as declared
+  6 review      named human reviewers, alignment table, review artifacts
+  7 freshness   when the record last changed vs. the code and CI
+  8 citation    a referee's checklist derived from the above, with a score
+
 Usage:
   fwcheck.py owner/repo [--ref BRANCH] [--json] [--no-scan]
   fwcheck.py --survey repos.txt --out survey.jsonl
-  fwcheck.py --summarize survey.jsonl
+  fwcheck.py --summarize survey.jsonl [--csv rows.csv]
 
 Auth: uses `gh auth token` or $GITHUB_TOKEN (needed for rate limits and the
 tarball download on larger repos).
@@ -200,6 +216,113 @@ class LeanScan:
     challenge_modules: dict = field(default_factory=dict)  # json path -> challenge_module
     big_files: list = field(default_factory=list)  # .lean files skipped for size
     skipped_reason: Optional[str] = None
+    workflows: dict = field(default_factory=dict)  # .github/workflows/*.yml -> text
+    other_files: list = field(default_factory=list)  # md/txt/yaml/json/tex paths (names only)
+    _decls: Optional[dict] = None  # lazily built declaration index
+
+
+_DECL_START = re.compile(
+    r"(?m)^(?P<attrs>\s*(?:@\[[^\]]*\]\s*)?)(?P<mods>(?:public\s+|private\s+|protected\s+|noncomputable\s+|nonrec\s+|unsafe\s+|partial\s+|meta\s+|scoped\s+)*)"
+    r"(?P<kind>theorem|lemma|def|abbrev|instance|structure|inductive|class|opaque|axiom)\s+(?P<name>[\w.'«»]+)")
+_END_KW = re.compile(r"(?m)^(?:end|namespace|section|open|variable|import|set_option|universe|#\w+)\b")
+_PROOF_LEADER = re.compile(r"^\s*(?:by\s+)?(?P<tac>[\w.?!'∘]+)")
+
+
+@dataclass
+class Decl:
+    kind: str
+    name: str
+    file: str
+    header: str      # from the name to `:=` / `where` / `|` (the statement, for theorems)
+    body: str        # the rest of the chunk
+    has_sorry: bool
+
+
+def decl_index(scan: "LeanScan") -> dict:
+    """name (last component and full) -> [Decl]; built once per scan."""
+    if scan._decls is not None:
+        return scan._decls
+    idx: dict = {}
+    for path, s in scan.sources.items():
+        starts = list(_DECL_START.finditer(s))
+        for i, m in enumerate(starts):
+            end = starts[i + 1].start() if i + 1 < len(starts) else len(s)
+            chunk = s[m.end():end]
+            # stop the chunk at a structural keyword at column 0
+            e = _END_KW.search(chunk)
+            if e:
+                chunk = chunk[:e.start()]
+            # split header / body at the first top-level `:=`, `where`, or pattern `|`
+            cut = None
+            for pat in (r":=", r"\bwhere\b", r"(?m)^\s*\|"):
+                mm = re.search(pat, chunk)
+                if mm and (cut is None or mm.start() < cut):
+                    cut = mm.start()
+            header = chunk if cut is None else chunk[:cut]
+            body = "" if cut is None else chunk[cut:]
+            d = Decl(m.group("kind"), m.group("name"), path, header.strip(), body.strip(),
+                     bool(_SORRY.search(body)) or m.group("kind") == "axiom")
+            for key in {d.name, d.name.split(".")[-1]}:
+                idx.setdefault(key, []).append(d)
+    scan._decls = idx
+    return idx
+
+
+_SHA40 = re.compile(r"\b[0-9a-f]{40}\b")
+_SHA7 = re.compile(r"\b[0-9a-f]{7,40}\b")
+_USES = re.compile(r"uses:\s*['\"]?([\w.-]+/[\w.-]+(?:/[\w./-]+)?)@([\w./-]+)")
+CHECKER_TOOLS = ("comparator", "lean4export", "landrun", "nanoda", "lean4checker", "lean4lean")
+
+
+def ref_class(ref: str) -> str:
+    if _SHA40.fullmatch(ref):
+        return "sha"
+    if re.fullmatch(r"v?\d+(\.\d+)*", ref):
+        return "tag"
+    if ref in ("main", "master", "latest", "HEAD"):
+        return "floating"
+    return "branch"
+
+
+def analyze_workflows(wfs: dict) -> dict:
+    """What the CI depends on, and whether it is pinned."""
+    actions: dict = {}
+    tools: dict = {}
+    for path, text in wfs.items():
+        for m in _USES.finditer(text):
+            name, ref = m.group(1), m.group(2)
+            if name.startswith("./"):
+                continue
+            actions.setdefault(name, set()).add(ref_class(ref))
+        low = text.lower()
+        for t in CHECKER_TOOLS:
+            if t not in low:
+                continue
+            # evidence of pinning anywhere in the file that mentions the tool
+            pinned = None
+            if _SHA40.search(text):
+                pinned = "sha"
+            elif re.search(r"(?:--branch|--tag|ref:|checkout)\s+['\"]?v?\d+\.\d+", text):
+                pinned = "tag"
+            elif re.search(r"(?:checkout|_COMMIT|_REV|_SHA)[:=\s]+['\"]?[0-9a-f]{7,40}\b", text):
+                pinned = "sha"
+            elif re.search(rf"{t}[^\n]*@(?:v?\d|[0-9a-f]{{7,}})", low):
+                pinned = "tag"
+            elif re.search(r"@main\b|@master\b|--branch\s+main|git clone\s+https?://\S+/" + t + r"(?:\.git)?\s*$", low, re.M):
+                pinned = "unpinned"
+            cur = tools.get(t)
+            if cur is None or (cur == "unknown" and pinned) or (cur == "unpinned" and pinned in ("sha", "tag")):
+                tools[t] = pinned or "unknown"
+    lean_action = {k: sorted(v) for k, v in actions.items() if "lean-action" in k}
+    floating = sorted(k for k, v in actions.items() if "floating" in v or "branch" in v)
+    return {
+        "workflow_files": sorted(wfs),
+        "actions_used": {k: sorted(v) for k, v in sorted(actions.items())},
+        "actions_floating": floating,
+        "lean_action": lean_action,
+        "checker_tools": tools,
+        "has_independent_check": any(t in tools for t in ("comparator", "nanoda", "lean4checker", "lean4lean", "lean4export")),
+    }
 
 
 def scan_tarball(data: bytes) -> LeanScan:
@@ -213,6 +336,11 @@ def scan_tarball(data: bytes) -> LeanScan:
             if "/.lake/" in "/" + rel or rel.startswith(".lake/"):
                 continue
             base = rel.rsplit("/", 1)[-1]
+            if rel.startswith(".github/workflows/") and rel.endswith((".yml", ".yaml")) and m.size < 256 * 1024:
+                scan.workflows[rel] = tf.extractfile(m).read().decode("utf-8", "replace")
+                continue
+            if rel.endswith((".md", ".txt", ".yaml", ".yml", ".tex", ".rst", ".csv")):
+                scan.other_files.append(rel)
             if base == "lean-toolchain":
                 scan.toolchains[rel] = tf.extractfile(m).read().decode("utf-8", "replace").strip()
                 continue
@@ -306,6 +434,7 @@ class Report:
     automation: str = ""
     role: str = ""
     findings: list = field(default_factory=list)
+    layers: dict = field(default_factory=dict)
     api_calls: int = 0
     error: str = ""
 
@@ -685,8 +814,327 @@ def check_repo(gh: GitHub, repo: str, ref: Optional[str], do_scan: bool = True) 
                 rep.add("ci_age", INFO, f"workflow '{name}' last ran {when}",
                         f"repository pushed {rep.pushed_at[:10]}, {(pushed - rd).days} days later (path-filtered, or not triggered?)")
 
+    try:
+        rep.layers = build_layers(gh, rep, doc, scan, configs, challenge_files, ref, workflows)
+    except Exception as e:  # layers are additive; never lose the base report
+        rep.layers = {"error": f"{type(e).__name__}: {e}"}
     rep.api_calls = gh.calls
     return rep
+
+
+# ----------------------------------------------------------------------------
+# Layers: what happens to a proof after `lake build` is green
+# ----------------------------------------------------------------------------
+
+_dep_cache: dict = {}
+_MODEL_NAME = re.compile(r"gpt|claude|codex|gemini|o[1-9]\b|llm|agent|astra|copilot|aristotle|deepseek|grok|model|bot\b|ai\b", re.I)
+_REVIEW_ARTIFACT = re.compile(r"(^|/)[^/]*(review|audit|alignment|side[-_]by[-_]side|fidelity|verification|certif|correspondence|statement[-_]check)[^/]*\.(md|txt|yaml|yml|tex|rst|csv)$", re.I)
+
+
+def dep_commit(gh: GitHub, url: str, rev: str) -> dict:
+    """Date and lean-toolchain of a dependency revision; cached across repos."""
+    key = (url, rev)
+    if key in _dep_cache:
+        return _dep_cache[key]
+    m = re.search(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url or "")
+    out: dict = {"repo": m.group(1) if m else None, "date": None, "toolchain": None}
+    if out["repo"] and rev:
+        c = gh.get(f"/repos/{out['repo']}/commits/{rev}")
+        if c:
+            out["date"] = ((c.get("commit") or {}).get("committer") or {}).get("date")
+            tc = gh.file(out["repo"], "lean-toolchain", rev)
+            out["toolchain"] = tc.strip() if tc else None
+    _dep_cache[key] = out
+    return out
+
+
+def _tc_match(a: str, b: str):
+    if a == b:
+        return True
+    va = re.search(r"v(\d+)\.(\d+)", a)
+    vb = re.search(r"v(\d+)\.(\d+)", b)
+    if va and vb and va.groups() == vb.groups():
+        return "patch"
+    return False
+
+
+def _days(a: Optional[str], b: Optional[str]) -> Optional[int]:
+    da, db = parse_iso(a or ""), parse_iso(b or "")
+    return (da - db).days if da and db else None
+
+
+def _stmt_triage(scan: LeanScan, decl_name: str, preferred: Optional[str], suspects: dict) -> Optional[dict]:
+    idx = decl_index(scan)
+    cands = idx.get(decl_name) or idx.get(decl_name.split(".")[-1]) or []
+    cands = [d for d in cands if path_class(d.file) == "code"] or cands
+    if preferred:
+        pf = preferred.lstrip("./")
+        cands = sorted(cands, key=lambda d: d.file != pf)
+    if not cands:
+        return None
+    d = cands[0]
+    header = d.header
+    body = d.body.lstrip(":= ").strip()
+    leader = _PROOF_LEADER.match(body)
+    tac = leader.group("tac") if leader else None
+    one_liner = "\n" not in body.strip() and len(body) < 80
+    words = set(re.findall(r"[\w.']+", header))
+    refs = {k: sorted(w for w in words if w in names or w.split(".")[-1] in names) for k, names in suspects.items()}
+    refs = {k: v for k, v in refs.items() if v}
+    return {
+        "declaration": d.name,
+        "file": d.file,
+        "kind": d.kind,
+        "statement_chars": len(header),
+        "binders": len(re.findall(r"[\(\{\[⦃]\s*[^\)\}\]⦄]*?:", header)),
+        "arrows": header.count("→") + header.count("->") + header.count("↔"),
+        "proof_leader": tac,
+        "proof_one_liner": one_liner,
+        "proof_sorry": bool(_SORRY.search(d.body)),
+        "proof_native_decide": bool(_NATIVE.search(d.body)),
+        "statement_references": refs,  # names in the statement that are axioms / opaque / sorry-bodied defs
+        "flags": [f for f, on in (
+            ("not-a-theorem", d.kind not in ("theorem", "lemma")),
+            ("trivial-proof", one_liner and tac in ("rfl", "trivial", "decide", "simp", "norm_num")),
+            ("native_decide", bool(_NATIVE.search(d.body))),
+            ("sorry-in-proof", bool(_SORRY.search(d.body))),
+            ("statement-uses-axiom", "axiom" in refs),
+            ("statement-uses-opaque", "opaque" in refs),
+            ("statement-uses-sorry-def", "sorry_def" in refs),
+            ("closed-statement", not re.search(r"[\(\{\[⦃]\s*[^\)\}\]⦄]*?:", header) and "→" not in header and "∀" not in header),
+        ) if on],
+    }
+
+
+def build_layers(gh: GitHub, rep: Report, doc: dict, scan: Optional[LeanScan], configs: dict,
+                 challenge_files: set, ref: str, workflows: list) -> dict:
+    status = doc.get("status") if isinstance(doc.get("status"), dict) else {}
+    main_results = [m for m in (status.get("main_results") or []) if isinstance(m, dict)] if isinstance(status.get("main_results"), list) else []
+    L: dict = {}
+
+    # without a source scan (thin wrapper, oversize tarball) fetch the few
+    # files these layers need directly
+    toolchains = dict(scan.toolchains) if scan else {}
+    manifests = dict(scan.manifests) if scan else {}
+    wf_texts = dict(scan.workflows) if scan else {}
+    if not scan or (not wf_texts and workflows):
+        if not toolchains:
+            t = gh.file(rep.repo, "lean-toolchain", ref)
+            if t:
+                toolchains["lean-toolchain"] = t.strip()
+        if not manifests:
+            t = gh.file(rep.repo, "lake-manifest.json", ref)
+            if t:
+                try:
+                    manifests["lake-manifest.json"] = json.loads(t)
+                except Exception:
+                    pass
+        for w in workflows:
+            p = w.get("path") or ""
+            if p and p not in wf_texts:
+                t = gh.file(rep.repo, p, ref)
+                if t:
+                    wf_texts[p] = t
+
+    # 1. rebuildability -----------------------------------------------------
+    tc = None
+    tc_path = None
+    if toolchains:
+        tc_path, tc = sorted(toolchains.items(), key=lambda kv: kv[0].count("/"))[0]
+    deps = []
+    mathlib = None
+    if manifests:
+        for p, m in sorted(manifests.items(), key=lambda kv: kv[0].count("/")):
+            if not m:
+                continue
+            for pk in m.get("packages", []):
+                if pk.get("type") == "path":
+                    continue
+                d = {"name": pk.get("name"), "url": pk.get("url"), "rev": (pk.get("rev") or "")[:40],
+                     "inputRev": pk.get("inputRev"), "inherited": pk.get("inherited")}
+                deps.append(d)
+            break  # root manifest only
+    for d in deps:
+        if d["name"] == "mathlib" and d["rev"]:
+            info = dep_commit(gh, d["url"], d["rev"])
+            mathlib = {"rev": d["rev"][:10], "inputRev": d["inputRev"], "date": info["date"],
+                       "age_days": _days(datetime.now(timezone.utc).isoformat(), info["date"]),
+                       "toolchain": info["toolchain"]}
+    # the manifest pins every rev; inputRev only says what `lake update` would chase
+    branch_req = [d["name"] for d in deps if d.get("inputRev") in ("main", "master")]
+    L["rebuild"] = {
+        "toolchain": tc,
+        "toolchain_file": tc_path,
+        "manifest": bool(deps) or any(manifests.values()),
+        "dependencies": len(deps),
+        "dependencies_requested_at_branch": branch_req,
+        "mathlib": mathlib,
+        # True: identical; "patch": same minor version (builds from source, no cache); False: different
+        "toolchain_matches_mathlib": _tc_match(tc, mathlib["toolchain"]) if (tc and mathlib and mathlib.get("toolchain")) else None,
+    }
+
+    # 2. checker supply chain -----------------------------------------------
+    L["checkers"] = analyze_workflows(wf_texts)
+    L["checkers"]["configs"] = len(configs)
+    L["checkers"]["workflows_active"] = len(workflows)
+
+    # 3. record <-> config <-> challenge linkage ----------------------------
+    links = []
+    if scan:
+        idx = decl_index(scan)
+        for ccs, cfg in configs.items():
+            if not isinstance(cfg, dict):
+                links.append({"config": ccs, "ok": False, "reason": "config missing or not JSON"})
+                continue
+            names = [str(n) for n in (cfg.get("theorem_names") or cfg.get("theorems") or [])]
+            mod = cfg.get("challenge_module") or cfg.get("challenge")
+            # the configured challenge module, wherever the package root is
+            chal_paths: set = set()
+            if mod:
+                rel = str(mod).replace(".", "/") + ".lean"
+                parts = ccs.split("/")[:-1]
+                for i in range(len(parts) + 1):
+                    cand = "/".join(parts[:i] + [rel]) if i else rel
+                    if cand in scan.sources:
+                        chal_paths.add(cand)
+            if not chal_paths:
+                chal_paths = {p for p in challenge_files if p in scan.sources}
+            in_chal, in_code, nowhere = [], [], []
+            for n in names:
+                ds = idx.get(n) or idx.get(n.split(".")[-1]) or []
+                files = {d.file for d in ds}
+                if files & chal_paths:
+                    in_chal.append(n)
+                if any(f not in chal_paths for f in files):
+                    in_code.append(n)
+                if not files:
+                    nowhere.append(n)
+            claimed = {str(m.get("declaration", "")).strip() for m in main_results if m.get("comparator_config") and str(m.get("comparator_config")).strip().lstrip("./") == ccs}
+            lasts = {n.split(".")[-1] for n in names}
+            linked = [c for c in claimed if c and (c in names or c.split(".")[-1] in lasts)]
+            links.append({
+                "config": ccs, "challenge_module": mod, "challenge_file_present": bool(chal_paths),
+                "theorem_names": len(names), "in_challenge": len(in_chal), "in_code": len(in_code),
+                "not_found": nowhere[:5],
+                "record_results_linked": len(linked), "record_results_claiming": len(claimed),
+                "ok": bool(names) and len(in_chal) == len(names) and len(in_code) == len(names) and len(linked) == len(claimed),
+            })
+    L["linkage"] = {"configs": links, "complete": all(l["ok"] for l in links) if links else None}
+
+    # 4. statement triage ---------------------------------------------------
+    triage = []
+    if scan:
+        idx = decl_index(scan)
+        suspects = {
+            "axiom": {d.name for ds in idx.values() for d in ds if d.kind == "axiom" and d.file not in challenge_files},
+            "opaque": {d.name for ds in idx.values() for d in ds if d.kind == "opaque"},
+            "sorry_def": {d.name for ds in idx.values() for d in ds if d.kind in ("def", "abbrev", "instance", "structure", "inductive") and d.has_sorry and d.file not in challenge_files},
+        }
+        suspects = {k: {n for n in v} | {n.split(".")[-1] for n in v} for k, v in suspects.items()}
+        for m in main_results:
+            decl = str(m.get("declaration", "")).strip()
+            if not decl or " " in decl:
+                continue
+            t = _stmt_triage(scan, decl, m.get("file"), suspects)
+            if t:
+                triage.append(t)
+    L["statements"] = {
+        "main_results": len(main_results), "triaged": triage,
+        "flags": sorted({f for t in triage for f in t["flags"]}),
+    }
+
+    # 5. literature dependencies and sources --------------------------------
+    lit = []
+    for m in main_results:
+        for ld in (m.get("literature_dependencies") or []) if isinstance(m.get("literature_dependencies"), list) else []:
+            if isinstance(ld, dict):
+                lit.append({"result": str(m.get("declaration", ""))[:80], "statement": str(ld.get("statement", ""))[:300], "source": str(ld.get("source", ""))[:200]})
+            else:
+                lit.append({"result": str(m.get("declaration", ""))[:80], "statement": str(ld)[:300], "source": ""})
+    for ld in (status.get("literature_dependencies") or []) if isinstance(status.get("literature_dependencies"), list) else []:
+        if isinstance(ld, dict):
+            lit.append({"result": "", "statement": str(ld.get("statement", ""))[:300], "source": str(ld.get("source", ""))[:200]})
+    srcs = []
+    for s in (doc.get("sources") or []) if isinstance(doc.get("sources"), list) else []:
+        if isinstance(s, dict):
+            srcs.append({"type": str(s.get("type", ""))[:40], "relationship": str(s.get("relationship", ""))[:40],
+                         "author_endorsement": str(s.get("author_endorsement", s.get("author_contacted", "")))[:40],
+                         "id": str(s.get("id", ""))[:120]})
+    fid = doc.get("fidelity") if isinstance(doc.get("fidelity"), dict) else {}
+    div = fid.get("divergences") if fid else None
+    L["literature"] = {
+        "dependencies": lit, "sources": srcs,
+        "divergences_chars": len(str(div)) if div else 0,
+        "divergences_declared": bool(div) and str(div).strip().lower() not in ("none", "n/a", "", "[]"),
+    }
+
+    # 6. review -------------------------------------------------------------
+    rv = doc.get("review") if isinstance(doc.get("review"), dict) else {}
+    reviewers = rv.get("reviewers") if isinstance(rv.get("reviewers"), list) else []
+    rnames = [str(r.get("name") if isinstance(r, dict) else r) for r in reviewers]
+    humans = [n for n in rnames if n and not _MODEL_NAME.search(n) and len(n) < 60]
+    st = (rep.review_status or "").lower()
+    align = doc.get("alignment") if isinstance(doc.get("alignment"), dict) else {}
+    stmts = align.get("statements") if isinstance(align.get("statements"), list) else []
+    artifacts = sorted(p for p in (scan.other_files if scan else []) if _REVIEW_ARTIFACT.search(p))[:10]
+    L["review"] = {
+        "status": rep.review_status, "reviewers": len(rnames), "human_reviewers": humans[:5],
+        "claims_human": bool(humans) or any(k in st for k in ("peer", "human", "author-verified")),
+        "alignment_statements": len(stmts), "artifacts": artifacts,
+        "notes_chars": len(str(rv.get("notes") or "")),
+    }
+
+    # 7. freshness / retraction ---------------------------------------------
+    rec_commits = gh.get(f"/repos/{rep.repo}/commits", {"path": "formalization.yaml", "sha": ref, "per_page": 100}) or []
+    rec_date = ((rec_commits[0].get("commit") or {}).get("committer") or {}).get("date") if rec_commits else None
+    head = gh.get(f"/repos/{rep.repo}/commits", {"sha": ref, "per_page": 1}) or []
+    head_date = ((head[0].get("commit") or {}).get("committer") or {}).get("date") if head else None
+    datelike = {}
+    for sect in ("status", "review", "project"):
+        blk = doc.get(sect) if isinstance(doc.get(sect), dict) else {}
+        for k, v in blk.items():
+            if re.search(r"date|_at$|verified|checked|updated|deprecated|retract|supersed|errat", str(k), re.I):
+                datelike[f"{sect}.{k}"] = str(v)[:40]
+    for k in ("deprecated_at", "retracted", "errata", "superseded_by", "last_verified", "verified_at", "updated"):
+        if k in doc:
+            datelike[k] = str(doc[k])[:40]
+    L["freshness"] = {
+        "record_last_changed": rec_date, "record_commits": len(rec_commits),
+        "head_commit": head_date, "record_lag_days": max(0, _days(head_date, rec_date)) if _days(head_date, rec_date) is not None else None,
+        "ci_latest_success": max([m.group(1) for f in rep.findings if f.check == "ci" and f.status == OK
+                                  for m in [re.search(r"\((\d{4}-\d{2}-\d{2})", f.evidence)] if m], default=None),
+        "record_fields": datelike,
+    }
+
+    # 8. citation readiness -------------------------------------------------
+    c = rep.counts()
+    nonci_bad = [f for f in rep.findings if f.status in (MISMATCH, STALE) and f.check not in ("ci", "ci_age")]
+    ci_ok = [f for f in rep.findings if f.check == "ci" and f.status == OK]
+    indep_ok = [f for f in ci_ok if re.search(r"comparator|kernel|replay|verif|check|export", f.claim, re.I)]
+    ci_bad = [f for f in rep.findings if f.check == "ci" and f.status == STALE]
+    sorry_ok = any(f.check == "sorry_count" and f.status == OK and f.claim.startswith("0") for f in rep.findings)
+    ax_ok = any(f.check == "axioms" and f.status == OK for f in rep.findings)
+    items = {
+        "build_pinned": bool(tc) and bool(deps),
+        "mathlib_under_6_months": (mathlib["age_days"] is not None and mathlib["age_days"] < 183) if mathlib else None,
+        "toolchain_consistent": None if L["rebuild"]["toolchain_matches_mathlib"] is None else L["rebuild"]["toolchain_matches_mathlib"] in (True, "patch"),
+        "ci_present": bool(workflows),
+        "ci_green": bool(ci_ok) and not ci_bad,
+        "independent_check_green": bool(indep_ok),
+        "checkers_pinned": (all(v in ("sha", "tag") for v in L["checkers"]["checker_tools"].values()) if L["checkers"]["checker_tools"] else None),
+        "record_matches_tree": (not nonci_bad) if scan else None,
+        "linkage_complete": L["linkage"]["complete"],
+        "no_sorry": sorry_ok if scan else None,
+        "standard_axioms_only": ax_ok if scan else None,
+        "statements_unflagged": (not L["statements"]["flags"]) if triage else None,
+        "literature_deps_declared": bool(lit) or None,
+        "divergences_declared": L["literature"]["divergences_declared"] or None,
+        "human_review_named": bool(humans),
+        "record_fresh": (L["freshness"]["record_lag_days"] is not None and L["freshness"]["record_lag_days"] <= 30),
+    }
+    applicable = {k: v for k, v in items.items() if v is not None}
+    L["citation"] = {"checklist": items, "score": sum(1 for v in applicable.values() if v), "of": len(applicable)}
+    return L
 
 
 # ----------------------------------------------------------------------------
@@ -708,6 +1156,54 @@ def print_report(rep: Report) -> None:
         claim = f.claim if len(f.claim) <= 64 else f.claim[:61] + "..."
         print(f"  {f.status:<13}{f.check:<18}{claim:<{width}}  {f.evidence}")
     print(f"  verdict: {rep.verdict()}")
+    if rep.layers:
+        print_layers(rep.layers)
+
+
+def _yn(v) -> str:
+    return "-" if v is None else ("yes" if v is True else ("patch-level" if v == "patch" else "NO"))
+
+
+def print_layers(L: dict) -> None:
+    if "error" in L:
+        print(f"  layers: error {L['error']}")
+        return
+    r, c, k, s, lit, rv, fr, ci = (L[x] for x in ("rebuild", "checkers", "linkage", "statements", "literature", "review", "freshness", "citation"))
+    print("  -- layers --")
+    ml = r.get("mathlib")
+    print(f"  1 rebuild     toolchain {r['toolchain'] or '(none)'}; deps {r['dependencies']}"
+          + (f"; mathlib {ml['rev']} ({ml['date'][:10] if ml['date'] else '?'}, {ml['age_days']} days old, its toolchain {ml['toolchain'] or '?'}: match {_yn(r['toolchain_matches_mathlib'])})" if ml else "; no mathlib")
+          + (f"; lakefile tracks a branch for: {', '.join(r['dependencies_requested_at_branch'])}" if r["dependencies_requested_at_branch"] else ""))
+    tools = ", ".join(f"{t}={p}" for t, p in c["checker_tools"].items()) or "none referenced"
+    print(f"  2 checkers    workflows {len(c['workflow_files'])}; checker tools: {tools}"
+          + (f"; lean-action {c['lean_action']}" if c.get("lean_action") else "")
+          + (f"; floating actions: {', '.join(c['actions_floating'][:4])}" if c.get("actions_floating") else ""))
+    if k["configs"]:
+        for l in k["configs"]:
+            if "reason" in l:
+                print(f"  3 linkage     {l['config']}: {l['reason']}")
+            else:
+                print(f"  3 linkage     {l['config']}: {l['theorem_names']} names; in challenge {l['in_challenge']}, in code {l['in_code']}, "
+                      f"record results linked {l['record_results_linked']}/{l['record_results_claiming']}"
+                      + (f"; not found: {', '.join(l['not_found'])}" if l["not_found"] else "") + f" -> {'ok' if l['ok'] else 'INCOMPLETE'}")
+    else:
+        print("  3 linkage     no comparator config")
+    for t in s["triaged"]:
+        print(f"  4 statement   {t['declaration']} ({t['kind']}, {t['binders']} binders, {t['arrows']} arrows, proof: {t['proof_leader'] or '...'}"
+              + (f"; refs {t['statement_references']}" if t["statement_references"] else "")
+              + (f"; flags: {', '.join(t['flags'])}" if t["flags"] else "") + ")")
+    if not s["triaged"]:
+        print(f"  4 statement   {s['main_results']} main results, none locatable for triage")
+    print(f"  5 literature  {len(lit['dependencies'])} literature dependencies; {len(lit['sources'])} sources"
+          + (f" ({', '.join(sorted({x['author_endorsement'] or '?' for x in lit['sources']}))})" if lit["sources"] else "")
+          + f"; divergences {'declared (' + str(lit['divergences_chars']) + ' chars)' if lit['divergences_declared'] else 'none'}")
+    print(f"  6 review      status {rv['status'] or '(none)'}; reviewers {rv['reviewers']} (human: {', '.join(rv['human_reviewers']) or 'none'}); "
+          f"alignment rows {rv['alignment_statements']}; artifacts: {', '.join(rv['artifacts']) or 'none'}")
+    print(f"  7 freshness   record last changed {str(fr['record_last_changed'])[:10]} ({fr['record_commits']} commits); head {str(fr['head_commit'])[:10]}; "
+          f"record lags head by {fr['record_lag_days']} days; last CI success {fr['ci_latest_success']}"
+          + (f"; fields: {fr['record_fields']}" if fr["record_fields"] else ""))
+    bad = [n for n, v in ci["checklist"].items() if v is False]
+    print(f"  8 citation    {ci['score']}/{ci['of']}" + (f"; failing: {', '.join(bad)}" if bad else ""))
 
 
 def report_json(rep: Report) -> dict:
@@ -755,6 +1251,114 @@ def summarize(path: str) -> None:
     for r in sorted(stale, key=lambda r: -r["stars"]):
         st = [f for f in r["findings"] if f["status"] == STALE]
         print(f"{r['repo']} ({r['stars']}★): " + " | ".join(f"{f['check']}: {f['claim']} / {f['evidence']}" for f in st[:2]))
+    summarize_layers([r for r in ok_rows if r.get("layers") and "error" not in r["layers"]])
+
+
+def _hist(vals, edges):
+    out = []
+    for lo, hi in zip(edges, edges[1:] + [None]):
+        n = sum(1 for v in vals if v is not None and v >= lo and (hi is None or v < hi))
+        out.append(f"{lo}{'-' + str(hi) if hi else '+'}:{n}")
+    return "  ".join(out)
+
+
+def summarize_layers(rows: list) -> None:
+    if not rows:
+        return
+    from collections import Counter
+    n = len(rows)
+    print(f"\n== layers ({n} repositories with layer data) ==")
+    # 1
+    R = [r["layers"]["rebuild"] for r in rows]
+    ages = [x["mathlib"]["age_days"] for x in R if x.get("mathlib")]
+    print(f"1 rebuild: toolchain file {sum(1 for x in R if x['toolchain'])}; manifest {sum(1 for x in R if x['manifest'])}; "
+          f"mathlib dependency {len(ages)}; toolchain vs mathlib's: same {sum(1 for x in R if x['toolchain_matches_mathlib'] is True)}, "
+          f"patch-level {sum(1 for x in R if x['toolchain_matches_mathlib'] == 'patch')}, different {sum(1 for x in R if x['toolchain_matches_mathlib'] is False)}")
+    print(f"   mathlib pin age (days): {_hist(ages, [0, 30, 90, 183, 365])}; median {sorted(ages)[len(ages)//2] if ages else '-'}")
+    tcs = Counter((x["toolchain"] or "").split(":")[-1].split("-")[0] for x in R if x["toolchain"])
+    print("   toolchains: " + ", ".join(f"{k} {v}" for k, v in tcs.most_common(8)))
+    # 2
+    C = [r["layers"]["checkers"] for r in rows]
+    tools = Counter()
+    pin = Counter()
+    for x in C:
+        for t, p in x["checker_tools"].items():
+            tools[t] += 1
+            pin[(t, p)] += 1
+    print(f"2 checkers: repos referencing a checker tool in CI {sum(1 for x in C if x['checker_tools'])}; "
+          + "; ".join(f"{t} {tools[t]} (sha {pin[(t,'sha')]}, tag {pin[(t,'tag')]}, unpinned {pin[(t,'unpinned')]}, unknown {pin[(t,'unknown')]})" for t in sorted(tools)))
+    la = Counter(tuple(sorted(v)) for x in C for k, v in x.get("lean_action", {}).items() for v in [v])
+    print(f"   lean-action pinned by: {dict(la)}; repos with floating third-party actions {sum(1 for x in C if x.get('actions_floating'))}")
+    # 3
+    K = [r["layers"]["linkage"] for r in rows if r["layers"]["linkage"]["configs"]]
+    cfgs = [c for x in K for c in x["configs"]]
+    print(f"3 linkage: repos with configs {len(K)}; configs {len(cfgs)}; complete {sum(1 for c in cfgs if c.get('ok'))}; "
+          f"names missing from challenge {sum(1 for c in cfgs if 'in_challenge' in c and c['in_challenge'] < c['theorem_names'])}; "
+          f"names missing from code {sum(1 for c in cfgs if 'in_code' in c and c['in_code'] < c['theorem_names'])}; "
+          f"record result not among names {sum(1 for c in cfgs if 'record_results_linked' in c and c['record_results_linked'] < c['record_results_claiming'])}")
+    # 4
+    S = [r["layers"]["statements"] for r in rows]
+    tri = [t for x in S for t in x["triaged"]]
+    fl = Counter(f for t in tri for f in t["flags"])
+    print(f"4 statements: main results {sum(x['main_results'] for x in S)}; triaged {len(tri)}; flags: " + ", ".join(f"{k} {v}" for k, v in fl.most_common()))
+    print(f"   proof leaders: " + ", ".join(f"{k} {v}" for k, v in Counter(t['proof_leader'] for t in tri).most_common(10)))
+    print(f"   binders: {_hist([t['binders'] for t in tri], [0, 1, 3, 6, 10])}")
+    # 5
+    Lt = [r["layers"]["literature"] for r in rows]
+    deps = [d for x in Lt for d in x["dependencies"]]
+    endo = Counter(s["author_endorsement"] or "(blank)" for x in Lt for s in x["sources"])
+    print(f"5 literature: repos declaring literature dependencies {sum(1 for x in Lt if x['dependencies'])}; dependencies {len(deps)}; "
+          f"divergences declared {sum(1 for x in Lt if x['divergences_declared'])}")
+    print("   author endorsement: " + ", ".join(f"{k} {v}" for k, v in endo.most_common(8)))
+    # 6
+    Rv = [r["layers"]["review"] for r in rows]
+    print(f"6 review: human reviewer named {sum(1 for x in Rv if x['human_reviewers'])}; claims human {sum(1 for x in Rv if x['claims_human'])}; "
+          f"alignment table {sum(1 for x in Rv if x['alignment_statements'])}; review artifact file {sum(1 for x in Rv if x['artifacts'])}")
+    # 7
+    F = [r["layers"]["freshness"] for r in rows]
+    lags = [x["record_lag_days"] for x in F]
+    print(f"7 freshness: record lags head (days): {_hist(lags, [0, 1, 30, 90, 180])}; record commits=1 {sum(1 for x in F if x['record_commits'] == 1)}; "
+          f"records with date/retraction fields {sum(1 for x in F if x['record_fields'])}")
+    # 8
+    Ci = [r["layers"]["citation"] for r in rows]
+    fails = Counter(k for x in Ci for k, v in x["checklist"].items() if v is False)
+    print(f"8 citation: score {_hist([round(100 * x['score'] / x['of']) if x['of'] else None for x in Ci], [0, 25, 50, 75, 90])} (percent)")
+    print("   most-failed items: " + ", ".join(f"{k} {v}" for k, v in fails.most_common(8)))
+
+
+def write_csv(path: str, out: str) -> None:
+    import csv
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    cols = ["repo", "stars", "pushed_at", "yaml_version", "schema", "review_status", "automation", "verdict",
+            "toolchain", "mathlib_rev", "mathlib_age_days", "toolchain_matches_mathlib",
+            "workflows", "checker_tools", "independent_check",
+            "configs", "linkage_complete",
+            "main_results", "statement_flags",
+            "literature_deps", "sources", "divergences_declared",
+            "review_human", "alignment_rows", "review_artifacts",
+            "record_last_changed", "record_lag_days", "ci_latest_success",
+            "citation_score", "citation_of", "citation_failing"]
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            L = r.get("layers") or {}
+            if r.get("error") or not L or "error" in L:
+                w.writerow([r["repo"], r.get("stars"), r.get("pushed_at"), r.get("yaml_version"), r.get("schema"), r.get("review_status"), r.get("automation"), r.get("verdict")] + [""] * (len(cols) - 8))
+                continue
+            ml = L["rebuild"].get("mathlib") or {}
+            w.writerow([
+                r["repo"], r["stars"], r["pushed_at"][:10], r["yaml_version"], r["schema"], r["review_status"], r["automation"], r["verdict"],
+                L["rebuild"]["toolchain"], ml.get("rev"), ml.get("age_days"), L["rebuild"]["toolchain_matches_mathlib"],
+                len(L["checkers"]["workflow_files"]), ";".join(f"{t}={p}" for t, p in L["checkers"]["checker_tools"].items()), L["checkers"]["has_independent_check"],
+                len(L["linkage"]["configs"]), L["linkage"]["complete"],
+                L["statements"]["main_results"], ";".join(L["statements"]["flags"]),
+                len(L["literature"]["dependencies"]), len(L["literature"]["sources"]), L["literature"]["divergences_declared"],
+                ";".join(L["review"]["human_reviewers"]), L["review"]["alignment_statements"], len(L["review"]["artifacts"]),
+                (L["freshness"]["record_last_changed"] or "")[:10], L["freshness"]["record_lag_days"], L["freshness"]["ci_latest_success"],
+                L["citation"]["score"], L["citation"]["of"], ";".join(k for k, v in L["citation"]["checklist"].items() if v is False),
+            ])
+    print(f"wrote {out}: {len(rows)} rows")
 
 
 def main() -> int:
@@ -766,6 +1370,7 @@ def main() -> int:
     ap.add_argument("--survey", help="file with one owner/repo per line")
     ap.add_argument("--out", help="jsonl output for --survey")
     ap.add_argument("--summarize", help="summarize a survey jsonl")
+    ap.add_argument("--csv", help="with --summarize: also write one row per repository to this CSV")
     ap.add_argument("--resume", action="store_true", help="skip repos already in --out")
     args = ap.parse_args()
     for stream in (sys.stdout, sys.stderr):
@@ -776,6 +1381,8 @@ def main() -> int:
 
     if args.summarize:
         summarize(args.summarize)
+        if args.csv:
+            write_csv(args.summarize, args.csv)
         return 0
 
     gh = GitHub(gh_token())
