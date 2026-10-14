@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 survey/*.jsonl
 survey/*.log
+survey/NOTES-private.md
