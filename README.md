@@ -57,6 +57,36 @@ python fwcheck.py --summarize survey/results.jsonl [--csv survey/rows.csv]   # a
 Needs Python 3.9+, `pyyaml`, `jsonschema`, and a GitHub token (`gh auth token`
 or `GITHUB_TOKEN`) for rate limits and tarball downloads.
 
+## In CI
+
+The point of the tool is to run it every time, so the record cannot drift
+from the repository without a red mark. One job, no Lean build:
+
+```yaml
+# .github/workflows/fwcheck.yml
+name: fwcheck
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"   # weekly, so a broken pin or a red checker surfaces even with no pushes
+jobs:
+  fwcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install pyyaml jsonschema
+      - run: |
+          curl -sSLO https://raw.githubusercontent.com/thefalsework/fwcheck/main/fwcheck.py
+          python fwcheck.py "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+```
+
+Exit code is 1 when any claim is stale or contradicted, so the job fails and
+the maintainer finds out the week it happens rather than three months later.
+Pin `fwcheck.py` to a commit instead of `main` if you want the check itself
+to be reproducible.
+
 ## Origin
 
 Written after finding that [thefalsework/papers](https://github.com/thefalsework/papers)
