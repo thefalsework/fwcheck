@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """fwcheck: does a formalization.yaml say what the repository shows?
 
 Reads a repository's formalization.yaml (Mathlib Initiative schema) and
@@ -878,9 +878,12 @@ def _stmt_triage(scan: LeanScan, decl_name: str, preferred: Optional[str], suspe
     leader = _PROOF_LEADER.match(body)
     tac = leader.group("tac") if leader else None
     one_liner = "\n" not in body.strip() and len(body) < 80
-    words = set(re.findall(r"[\w.']+", header))
-    refs = {k: sorted(w for w in words if w in names or w.split(".")[-1] in names) for k, names in suspects.items()}
-    refs = {k: v for k, v in refs.items() if v}
+    def _refs(text: str) -> dict:
+        words = set(re.findall(r"[\w.']+", text))
+        out = {k: sorted(w for w in words if w in names or w.split(".")[-1] in names) for k, names in suspects.items()}
+        return {k: v for k, v in out.items() if v}
+    refs = _refs(header)
+    prefs = _refs(d.body)
     return {
         "declaration": d.name,
         "file": d.file,
@@ -893,6 +896,7 @@ def _stmt_triage(scan: LeanScan, decl_name: str, preferred: Optional[str], suspe
         "proof_sorry": bool(_SORRY.search(d.body)),
         "proof_native_decide": bool(_NATIVE.search(d.body)),
         "statement_references": refs,  # names in the statement that are axioms / opaque / sorry-bodied defs
+        "proof_references": prefs,     # same, in the proof term (direct use only; transitive use needs the kernel)
         "flags": [f for f, on in (
             ("not-a-theorem", d.kind not in ("theorem", "lemma")),
             ("trivial-proof", one_liner and tac in ("rfl", "trivial", "decide", "simp", "norm_num")),
@@ -901,6 +905,8 @@ def _stmt_triage(scan: LeanScan, decl_name: str, preferred: Optional[str], suspe
             ("statement-uses-axiom", "axiom" in refs),
             ("statement-uses-opaque", "opaque" in refs),
             ("statement-uses-sorry-def", "sorry_def" in refs),
+            ("proof-uses-axiom", "axiom" in prefs),
+            ("proof-uses-sorry-def", "sorry_def" in prefs),
             ("closed-statement", not re.search(r"[\(\{\[⦃]\s*[^\)\}\]⦄]*?:", header) and "→" not in header and "∀" not in header),
         ) if on],
     }
@@ -1072,13 +1078,26 @@ def build_layers(gh: GitHub, rep: Report, doc: dict, scan: Optional[LeanScan], c
     rv = doc.get("review") if isinstance(doc.get("review"), dict) else {}
     reviewers = rv.get("reviewers") if isinstance(rv.get("reviewers"), list) else []
     rnames = [str(r.get("name") if isinstance(r, dict) else r) for r in reviewers]
-    humans = [n for n in rnames if n and not _MODEL_NAME.search(n) and len(n) < 60]
+    humans = [n for n in rnames if n and not _MODEL_NAME.search(n) and len(n) < 60
+              and not re.fullmatch(r"(none|n/?a|tbd|self|author|automated.*|\{\{.*\}\}|\s*)", n.strip(), re.I)]
+    proj = doc.get("project") if isinstance(doc.get("project"), dict) else {}
+    authors = []
+    for a in (proj.get("authors") or []) if isinstance(proj.get("authors"), list) else []:
+        authors.append(str(a.get("name") if isinstance(a, dict) else a).strip().lower())
+    for a in (proj.get("responsible_maintainers") or []) if isinstance(proj.get("responsible_maintainers"), list) else []:
+        authors.append(str(a.get("name") if isinstance(a, dict) else a).strip().lower())
+
+    def _is_author(n: str) -> bool:
+        base = re.sub(r"\s*\(.*\)\s*$", "", n).strip().lower()
+        return "(self" in n.lower() or base in authors or any(base and base in a for a in authors)
+    independent = [n for n in humans if not _is_author(n)]
     st = (rep.review_status or "").lower()
     align = doc.get("alignment") if isinstance(doc.get("alignment"), dict) else {}
     stmts = align.get("statements") if isinstance(align.get("statements"), list) else []
     artifacts = sorted(p for p in (scan.other_files if scan else []) if _REVIEW_ARTIFACT.search(p))[:10]
     L["review"] = {
         "status": rep.review_status, "reviewers": len(rnames), "human_reviewers": humans[:5],
+        "independent_reviewers": independent[:5],  # humans who are not the project's authors/maintainers
         "claims_human": bool(humans) or any(k in st for k in ("peer", "human", "author-verified")),
         "alignment_statements": len(stmts), "artifacts": artifacts,
         "notes_chars": len(str(rv.get("notes") or "")),
@@ -1130,6 +1149,7 @@ def build_layers(gh: GitHub, rep: Report, doc: dict, scan: Optional[LeanScan], c
         "literature_deps_declared": bool(lit) or None,
         "divergences_declared": L["literature"]["divergences_declared"] or None,
         "human_review_named": bool(humans),
+        "independent_review_named": bool(independent),
         "record_fresh": (L["freshness"]["record_lag_days"] is not None and L["freshness"]["record_lag_days"] <= 30),
     }
     applicable = {k: v for k, v in items.items() if v is not None}
@@ -1190,14 +1210,16 @@ def print_layers(L: dict) -> None:
         print("  3 linkage     no comparator config")
     for t in s["triaged"]:
         print(f"  4 statement   {t['declaration']} ({t['kind']}, {t['binders']} binders, {t['arrows']} arrows, proof: {t['proof_leader'] or '...'}"
-              + (f"; refs {t['statement_references']}" if t["statement_references"] else "")
+              + (f"; statement refs {t['statement_references']}" if t["statement_references"] else "")
+              + (f"; proof refs {t['proof_references']}" if t.get("proof_references") else "")
               + (f"; flags: {', '.join(t['flags'])}" if t["flags"] else "") + ")")
     if not s["triaged"]:
         print(f"  4 statement   {s['main_results']} main results, none locatable for triage")
     print(f"  5 literature  {len(lit['dependencies'])} literature dependencies; {len(lit['sources'])} sources"
           + (f" ({', '.join(sorted({x['author_endorsement'] or '?' for x in lit['sources']}))})" if lit["sources"] else "")
           + f"; divergences {'declared (' + str(lit['divergences_chars']) + ' chars)' if lit['divergences_declared'] else 'none'}")
-    print(f"  6 review      status {rv['status'] or '(none)'}; reviewers {rv['reviewers']} (human: {', '.join(rv['human_reviewers']) or 'none'}); "
+    print(f"  6 review      status {rv['status'] or '(none)'}; reviewers {rv['reviewers']} (human: {', '.join(rv['human_reviewers']) or 'none'}; "
+          f"independent of authors: {', '.join(rv['independent_reviewers']) or 'none'}); "
           f"alignment rows {rv['alignment_statements']}; artifacts: {', '.join(rv['artifacts']) or 'none'}")
     print(f"  7 freshness   record last changed {str(fr['record_last_changed'])[:10]} ({fr['record_commits']} commits); head {str(fr['head_commit'])[:10]}; "
           f"record lags head by {fr['record_lag_days']} days; last CI success {fr['ci_latest_success']}"
@@ -1312,7 +1334,8 @@ def summarize_layers(rows: list) -> None:
     print("   author endorsement: " + ", ".join(f"{k} {v}" for k, v in endo.most_common(8)))
     # 6
     Rv = [r["layers"]["review"] for r in rows]
-    print(f"6 review: human reviewer named {sum(1 for x in Rv if x['human_reviewers'])}; claims human {sum(1 for x in Rv if x['claims_human'])}; "
+    print(f"6 review: human reviewer named {sum(1 for x in Rv if x['human_reviewers'])}; independent of the authors {sum(1 for x in Rv if x.get('independent_reviewers'))}; "
+          f"claims human {sum(1 for x in Rv if x['claims_human'])}; "
           f"alignment table {sum(1 for x in Rv if x['alignment_statements'])}; review artifact file {sum(1 for x in Rv if x['artifacts'])}")
     # 7
     F = [r["layers"]["freshness"] for r in rows]
@@ -1335,7 +1358,7 @@ def write_csv(path: str, out: str) -> None:
             "configs", "linkage_complete",
             "main_results", "statement_flags",
             "literature_deps", "sources", "divergences_declared",
-            "review_human", "alignment_rows", "review_artifacts",
+            "review_human", "review_independent", "alignment_rows", "review_artifacts",
             "record_last_changed", "record_lag_days", "ci_latest_success",
             "citation_score", "citation_of", "citation_failing"]
     with open(out, "w", newline="", encoding="utf-8") as f:
@@ -1354,7 +1377,7 @@ def write_csv(path: str, out: str) -> None:
                 len(L["linkage"]["configs"]), L["linkage"]["complete"],
                 L["statements"]["main_results"], ";".join(L["statements"]["flags"]),
                 len(L["literature"]["dependencies"]), len(L["literature"]["sources"]), L["literature"]["divergences_declared"],
-                ";".join(L["review"]["human_reviewers"]), L["review"]["alignment_statements"], len(L["review"]["artifacts"]),
+                ";".join(L["review"]["human_reviewers"]), ";".join(L["review"].get("independent_reviewers", [])), L["review"]["alignment_statements"], len(L["review"]["artifacts"]),
                 (L["freshness"]["record_last_changed"] or "")[:10], L["freshness"]["record_lag_days"], L["freshness"]["ci_latest_success"],
                 L["citation"]["score"], L["citation"]["of"], ";".join(k for k, v in L["citation"]["checklist"].items() if v is False),
             ])
