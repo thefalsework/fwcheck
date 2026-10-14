@@ -1079,7 +1079,8 @@ def build_layers(gh: GitHub, rep: Report, doc: dict, scan: Optional[LeanScan], c
     reviewers = rv.get("reviewers") if isinstance(rv.get("reviewers"), list) else []
     rnames = [str(r.get("name") if isinstance(r, dict) else r) for r in reviewers]
     humans = [n for n in rnames if n and not _MODEL_NAME.search(n) and len(n) < 60
-              and not re.fullmatch(r"(none|n/?a|tbd|self|author|automated.*|\{\{.*\}\}|\s*)", n.strip(), re.I)]
+              and not re.fullmatch(r"(none|n/?a|tbd|self|author|\{\{.*\}\}|\s*)", n.strip(), re.I)
+              and not re.search(r"template|automat|lane|pipeline|harness|kernel|comparator|review", n, re.I)]
     proj = doc.get("project") if isinstance(doc.get("project"), dict) else {}
     authors = []
     for a in (proj.get("authors") or []) if isinstance(proj.get("authors"), list) else []:
